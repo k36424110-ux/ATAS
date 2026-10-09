@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FlowDeck · BTC order flow</title>
+<style>
+:root{--bg:#0b0e14;--p:#121722;--ln:#1f2735;--t:#cfd6e4;--m:#6b7689;--g:#26d07c;--r:#ff4d5e}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--t);font:12px/1.4 ui-monospace,Menlo,Consolas,monospace}
+#app{display:grid;grid-template-rows:auto 1fr 130px;height:100%}
+#top{display:flex;gap:6px 16px;align-items:center;flex-wrap:wrap;padding:6px 10px;background:var(--p);border-bottom:1px solid var(--ln)}
+#top b{font-weight:600}.big{font-size:18px;font-weight:700}.sp{flex:1}
+#top select,#top input{background:var(--bg);color:var(--t);border:1px solid var(--ln);border-radius:4px;padding:2px 4px;font:inherit}
+main{display:grid;grid-template-columns:1fr 130px 230px;min-height:0}
+.box{position:relative;min-height:0;min-width:0;overflow:hidden}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+aside{background:var(--p);border-left:1px solid var(--ln);overflow:auto;padding:8px}
+aside label{display:flex;align-items:center;gap:6px;margin:2px 0;cursor:pointer}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--r)}.dot.ok{background:var(--g)}
+#tape div{padding:1px 0;border-bottom:1px solid var(--ln);white-space:nowrap}
+.up{color:var(--g)}.dn{color:var(--r)}.liq{font-weight:700}
+footer{border-top:1px solid var(--ln)}
+@media(max-width:800px){main{grid-template-columns:1fr 90px}aside{display:none}}
+</style></head><body>
+<div id="app">
+<header id="top">
+ <b>FlowDeck</b><span>BTC</span><span id="px" class="big">…</span>
+ <span>Δ1m <b id="d1">–</b></span><span>Δ5m <b id="d5">–</b></span>
+ <span>Vol1m <b id="v1">–</b></span><span>Bid% <b id="im">–</b></span>
+ <span>Funding <b id="fu">–</b></span><span>OI <b id="oi">–</b></span>
+ <span class="sp"></span>
+ <label>Pas <select id="bk"><option>1</option><option>2</option><option>5</option><option selected>10</option><option>25</option><option>50</option><option>100</option></select></label>
+ <label>Bulles ≥ <select id="mq"><option value="0.05">0.05</option><option value="0.2">0.2</option><option value="0.5" selected>0.5</option><option value="1">1</option><option value="5">5</option></select> BTC</label>
+ <label>Gain <input id="gn" type="range" min="0.3" max="3" step="0.1" value="1"></label>
+</header>
+<main>
+ <div class="box"><canvas id="hc"></canvas></div>
+ <div class="box"><canvas id="pc"></canvas></div>
+ <aside>
+  <div id="exs"></div>
+  <hr style="border:0;border-top:1px solid var(--ln)">
+  <div style="color:var(--m)">Liquidations et trades ≥ 5 BTC</div>
+  <div id="tape"></div>
+ </aside>
+</main>
+<footer class="box"><canvas id="cc"></canvas></footer>
+</div>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const EX=['Binance','Bybit','OKX','Coinbase'];
+const XC={Binance:'#f0b90b',Bybit:'#ff8a3d',OKX:'#b8c4d9',Coinbase:'#3d8bff'};
+const BIG=5, BUCKETS=[1,2,5,10,25,50,100];
+const S={bucket:10,colMs:500,colW:2,rowH:4,gain:1,minQ:.5,ref:0,center:0,mid:0,last:0,imb:50,
+ on:{Binance:1,Bybit:1,OKX:1,Coinbase:1},st:{},books:{},cvd:{},
+ cols:[],trades:[],tape:[],prof:new Map(),profB:new Map(),fund:null,oi:null};
+EX.forEach(e=>{S.books[e]={b:new Map(),a:new Map()};S.cvd[e]=0;S.st[e]=0});
+const hist=[];
+
+/* ---------- ingestion ---------- */
+const lvl=(ex,s,p,q)=>{const m=S.books[ex][s];q>0?m.set(p,q):m.delete(p)};
+const clr=ex=>{S.books[ex].b.clear();S.books[ex].a.clear()};
+function trade(ex,p,q,buy,t=Date.now()){
+  if(!S.mid){S.mid=p;S.center=p}
+  S.last=p;S.trades.push({t,p,q,buy,ex});S.cvd[ex]+=buy?q:-q;
+  if(S.on[ex]){const k=Math.round(p),v=S.prof.get(k)||[0,0];v[buy?0:1]+=q;S.prof.set(k,v)}
+  if(q>=BIG)tape(ex,`${buy?'ACHAT':'VENTE'} ${q.toFixed(2)} @ ${p.toFixed(1)}`,buy?'up':'dn',t)}
+function liq(ex,p,q,long,t=Date.now()){
+  if(p*q<5000)return;
+  tape(ex,`LIQ ${long?'long':'short'} ${q.toFixed(3)} @ ${p.toFixed(1)} ($${Math.round(p*q/1000)}k)`,long?'dn liq':'up liq',t)}
+function tape(ex,txt,cls,t){S.tape.unshift({ex,txt,cls,t});if(S.tape.length>40)S.tape.pop()}
+
+function conn(ex,url,onopen,onmsg,ping){
+  let ws,pt;
+  const go=()=>{
+    ws=new WebSocket(url);
+    ws.onopen=()=>{S.st[ex]=1;clr(ex);onopen(ws);if(ping)pt=setInterval(()=>ws.readyState===1&&ws.send(ping.m),ping.ms)};
+    ws.onmessage=e=>{if(typeof e.data!=='string'||e.data[0]!=='{')return;try{onmsg(JSON.parse(e.data),ws)}catch(x){console.warn(ex,x)}};
+    ws.onclose=()=>{S.st[ex]=0;clearInterval(pt);setTimeout(go,2500)};
+    ws.onerror=()=>ws.close()};
+  go()}
+
+/* Binance USDT-M perp : carnet synchronisé (snapshot REST + flux diff) */
+(()=>{const B=S.books.Binance;let buf=[],ready=false,snapId=0,prevU=null,busy=false;
+  const apply=e=>{
+    if(e.u<=snapId)return;
+    if(prevU!==null&&e.pu!==prevU){sync();return}
+    e.b.forEach(([p,q])=>lvl('Binance','b',+p,+q));e.a.forEach(([p,q])=>lvl('Binance','a',+p,+q));prevU=e.u};
+  async function sync(){
+    if(busy)return;busy=true;ready=false;buf=[];prevU=null;
+    await new Promise(r=>setTimeout(r,700));
+    try{const r=await fetch('https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000').then(r=>r.json());
+      if(!r.bids)throw 0;clr('Binance');
+      r.bids.forEach(([p,q])=>B.b.set(+p,+q));r.asks.forEach(([p,q])=>B.a.set(+p,+q));
+      snapId=r.lastUpdateId;ready=true;buf.forEach(apply);buf=[]}
+    catch(x){console.warn('Binance snapshot KO (accès bloqué ?)');setTimeout(sync,5000)}
+    busy=false}
+  conn('Binance','wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@depth@100ms/btcusdt@forceOrder',
+    ()=>sync(),
+    m=>{const d=m.data,s=m.stream;
+      if(s.endsWith('aggTrade'))trade('Binance',+d.p,+d.q,!d.m,d.T);
+      else if(s.endsWith('forceOrder'))liq('Binance',+d.o.ap||+d.o.p,+d.o.z||+d.o.q,d.o.S==='SELL',d.E);
+      else if(ready)apply(d);else buf.push(d)})})();
+
+conn('Bybit','wss://stream.bybit.com/v5/public/linear',
+  ws=>ws.send(JSON.stringify({op:'subscribe',args:['orderbook.200.BTCUSDT','publicTrade.BTCUSDT','allLiquidation.BTCUSDT']})),
+  m=>{if(!m.topic)return;const t=m.topic;
+    if(t.startsWith('orderbook')){if(m.type==='snapshot')clr('Bybit');
+      m.data.b.forEach(([p,q])=>lvl('Bybit','b',+p,+q));m.data.a.forEach(([p,q])=>lvl('Bybit','a',+p,+q))}
+    else if(t.startsWith('publicTrade'))m.data.forEach(x=>trade('Bybit',+x.p,+x.v,x.S==='Buy',x.T));
+    else if(t.startsWith('allLiquidation'))m.data.forEach(x=>liq('Bybit',+x.p,+x.v,x.S==='Buy',x.T))},
+  {m:'{"op":"ping"}',ms:20000});
+
+const OI='BTC-USDT-SWAP',CT=.01; // 1 contrat OKX = 0,01 BTC
+conn('OKX','wss://ws.okx.com:8443/ws/v5/public',
+  ws=>ws.send(JSON.stringify({op:'subscribe',args:[{channel:'books',instId:OI},{channel:'trades',instId:OI}]})),
+  m=>{if(!m.data||!m.arg)return;
+    if(m.arg.channel==='books'){const d=m.data[0];if(m.action==='snapshot')clr('OKX');
+      d.bids.forEach(x=>lvl('OKX','b',+x[0],+x[1]*CT));d.asks.forEach(x=>lvl('OKX','a',+x[0],+x[1]*CT))}
+    else if(m.arg.channel==='trades')m.data.forEach(x=>trade('OKX',+x.px,+x.sz*CT,x.side==='buy',+x.ts))},
+  {m:'ping',ms:25000});
+
+conn('Coinbase','wss://ws-feed.exchange.coinbase.com',
+  ws=>ws.send(JSON.stringify({type:'subscribe',product_ids:['BTC-USD'],channels:['level2_batch','matches']})),
+  m=>{if(m.type==='snapshot'){m.bids.forEach(([p,q])=>lvl('Coinbase','b',+p,+q));m.asks.forEach(([p,q])=>lvl('Coinbase','a',+p,+q))}
+    else if(m.type==='l2update')m.changes.forEach(([s,p,q])=>lvl('Coinbase',s==='buy'?'b':'a',+p,+q));
+    else if(m.type==='match')trade('Coinbase',+m.price,+m.size,m.side==='sell',Date.parse(m.time))});
+
+async function poll(){try{
+  const [a,b]=await Promise.all(['premiumIndex','openInterest'].map(k=>fetch(`https://fapi.binance.com/fapi/v1/${k}?symbol=BTCUSDT`).then(r=>r.json())));
+  S.fund=+a.lastFundingRate;S.oi=+b.openInterest}catch(e){}}
+poll();setInterval(poll,15000);
+
+/* ---------- heatmap ---------- */
+const hc=$('hc'),hx=hc.getContext('2d'),pc=$('pc'),px=pc.getContext('2d'),cc=$('cc'),cx=cc.getContext('2d');
+const hm=document.createElement('canvas'),mx=hm.getContext('2d');
+const LUT=(()=>{const st=[[0,[11,14,20]],[.25,[24,44,130]],[.5,[0,170,200]],[.75,[250,220,60]],[1,[255,255,255]]],o=[];
+  for(let i=0;i<=255;i++){const v=i/255;let j=1;while(j<4&&v>st[j][0])j++;
+    const [a,A]=st[j-1],[b,B]=st[j],f=(v-a)/(b-a);o.push(`rgb(${A.map((c,k)=>Math.round(c+(B[k]-c)*f)).join(',')})`)}return o})();
+const geo=()=>{const rows=Math.floor(hc.height/S.rowH);return{rows,lo:S.center-rows*S.bucket/2}};
+const Yp=(p,g,H)=>H-(p-g.lo)/S.bucket*S.rowH;
+const norm=v=>Math.min(1,Math.sqrt(v/(S.ref||1))*S.gain*.55);
+
+function drawCol(c,x,g){
+  const H=hm.height;
+  for(let j=0;j<c.k.length;j++){
+    const n=norm(c.v[j]);if(n<.05)continue;
+    const top=Yp((c.k[j]+1)*c.b,g,H),h=Math.max(1,c.b/S.bucket*S.rowH);
+    if(top>H||top+h<0)continue;
+    mx.fillStyle=LUT[Math.ceil(n*255)];mx.fillRect(x,top,S.colW,Math.ceil(h))}}
+function redraw(){
+  mx.fillStyle='#0b0e14';mx.fillRect(0,0,hm.width,hm.height);
+  const g=geo(),n=Math.ceil(hm.width/S.colW),L=S.cols.length;
+  for(let i=Math.max(0,L-n);i<L;i++)drawCol(S.cols[i],hm.width-(L-i)*S.colW,g)}
+
+function snap(){
+  const now=Date.now(),idx=new Map();let bb=0,ba=1e12,bs=0,as=0;
+  const m0=S.mid,band=m0*.0025;
+  for(const ex of EX)for(const side of['b','a']){const m=S.books[ex][side];
+    for(const[p,q]of m){
+      if(m0&&Math.abs(p-m0)>m0*.03){m.delete(p);continue}
+      if(ex==='Binance'){if(side==='b'){if(p>bb)bb=p}else if(p<ba)ba=p}
+      if(!S.on[ex])continue;
+      if(m0&&Math.abs(p-m0)<band){p<m0?bs+=q:as+=q}
+      const i=Math.floor(p/S.bucket);idx.set(i,(idx.get(i)||0)+q)}}
+  if(bb&&ba<1e12)S.mid=(bb+ba)/2;else if(S.last)S.mid=S.last;
+  if(bs+as>0)S.imb=100*bs/(bs+as);
+  if(!S.mid)return;
+  const k=Int32Array.from(idx.keys()),v=Float32Array.from(idx.values());
+  if(v.length){const s=Float32Array.from(v).sort(),p95=s[Math.floor(s.length*.95)]*3;S.ref=S.ref?S.ref*.9+p95*.1:p95}
+  const col={t:now,b:S.bucket,k,v};S.cols.push(col);if(S.cols.length>2000)S.cols.shift();
+  const g0=geo();
+  if(Math.abs(S.mid-S.center)>g0.rows*S.bucket*.3){S.center=S.mid;redraw()}
+  else{mx.drawImage(hm,-S.colW,0);mx.fillStyle='#0b0e14';mx.fillRect(hm.width-S.colW,0,S.colW,hm.height);drawCol(col,hm.width-S.colW,geo())}
+  // nettoyage + profil
+  const cut=now-9e5;let i=0;while(i<S.trades.length&&S.trades[i].t<cut)i++;if(i)S.trades.splice(0,i);
+  const pb=new Map();for(const[p,[b,s]]of S.prof){const j=Math.floor(p/S.bucket),o=pb.get(j)||[0,0];o[0]+=b;o[1]+=s;pb.set(j,o)}S.profB=pb}
+
+function nice(x){for(const s of[1,2,5,10,20,25,50,100,200,250,500,1000,2000])if(s>=x)return s;return 5000}
+function frame(){
+  const W=hc.width,H=hc.height,g=geo();
+  hx.fillStyle='#0b0e14';hx.fillRect(0,0,W,H);hx.drawImage(hm,0,0);
+  // grille + axe prix
+  const step=nice(60*S.bucket/S.rowH);hx.font='11px ui-monospace,monospace';hx.textAlign='right';
+  for(let p=Math.ceil(g.lo/step)*step;p<g.lo+g.rows*S.bucket;p+=step){const y=Yp(p,g,H);
+    hx.fillStyle='rgba(255,255,255,.06)';hx.fillRect(0,y,W,1);hx.fillStyle='#8a95aa';hx.fillText(p.toLocaleString('fr-FR'),W-4,y-2)}
+  // bulles de trades
+  const t0=S.cols.length?S.cols[S.cols.length-1].t:Date.now(),k=S.colW/S.colMs;
+  for(const t of S.trades){
+    if(t.q<S.minQ||!S.on[t.ex])continue;
+    const x=Math.min(W-3,W-(t0-t.t)*k);if(x<0)continue;
+    const y=Yp(t.p,g,H);if(y<0||y>H)continue;
+    hx.fillStyle=t.buy?'rgba(38,208,124,.55)':'rgba(255,77,94,.55)';
+    hx.beginPath();hx.arc(x,y,Math.min(22,2+Math.sqrt(t.q)*3),0,6.3);hx.fill()}
+  // prix
+  if(S.mid){const y=Yp(S.mid,g,H);hx.strokeStyle='rgba(255,255,255,.55)';hx.setLineDash([4,4]);hx.beginPath();hx.moveTo(0,y);hx.lineTo(W,y);hx.stroke();hx.setLineDash([])}
+  drawProf(g);requestAnimationFrame(frame)}
+
+function drawProf(g){
+  const W=pc.width,H=pc.height;px.fillStyle='#0f131c';px.fillRect(0,0,W,H);
+  const c=S.cols[S.cols.length-1],R=new Map();
+  if(c)for(let j=0;j<c.k.length;j++){const i=Math.floor(c.k[j]*c.b/S.bucket);R.set(i,(R.get(i)||0)+c.v[j])}
+  let mv=1,poc=-1;for(const[i,[b,s]]of S.profB)if(b+s>mv){mv=b+s;poc=i}
+  const i0=Math.floor(g.lo/S.bucket);
+  for(let r=0;r<=g.rows;r++){const i=i0+r,y=Yp((i+1)*S.bucket,g,H),h=Math.max(1,S.rowH-1);
+    const rv=R.get(i);if(rv){const w=Math.min(W*.5,norm(rv)*W*.5);px.fillStyle=i*S.bucket<S.mid?'rgba(0,170,200,.55)':'rgba(255,138,61,.55)';px.fillRect(W-w,y,w,h)}
+    const v=S.profB.get(i);if(v){const wb=v[0]/mv*W*.55,ws=v[1]/mv*W*.55;
+      px.fillStyle=i===poc?'#ffd84d':'rgba(38,208,124,.8)';px.fillRect(0,y,wb,h);
+      px.fillStyle=i===poc?'#ffd84d':'rgba(255,77,94,.8)';px.fillRect(wb,y,ws,h)}}}
+
+/* ---------- CVD + stats ---------- */
+const tot=e=>EX.reduce((a,x)=>a+(S.on[x]?e.c[x]:0),0);
+function sample(){
+  hist.push({t:Date.now(),c:{...S.cvd}});if(hist.length>900)hist.shift();
+  const cur=hist[hist.length-1],ago=ms=>{for(let i=hist.length-1;i>=0;i--)if(hist[i].t<=cur.t-ms)return tot(cur)-tot(hist[i]);return tot(cur)-tot(hist[0])};
+  const f=(el,v,u='')=>{el.textContent=(v>0?'+':'')+v.toFixed(1)+u;el.className=v>=0?'up':'dn'};
+  f($('d1'),ago(6e4));f($('d5'),ago(3e5));
+  let v1=0;for(let i=S.trades.length-1;i>=0&&S.trades[i].t>cur.t-6e4;i--)if(S.on[S.trades[i].ex])v1+=S.trades[i].q;
+  $('v1').textContent=v1.toFixed(1);$('im').textContent=S.imb.toFixed(0)+'%';$('im').className=S.imb>=50?'up':'dn';
+  if(S.mid)$('px').textContent=S.mid.toLocaleString('fr-FR',{minimumFractionDigits:1,maximumFractionDigits:1});
+  if(S.fund!=null){$('fu').textContent=(S.fund*100).toFixed(4)+'%';$('fu').className=S.fund>=0?'up':'dn'}
+  if(S.oi)$('oi').textContent=Math.round(S.oi).toLocaleString('fr-FR')+' BTC';
+  $('exs').querySelectorAll('.dot').forEach(d=>d.classList.toggle('ok',!!S.st[d.dataset.e]));
+  $('tape').innerHTML=S.tape.map(t=>`<div class="${t.cls}"><span style="color:${XC[t.ex]}">${t.ex.slice(0,3)}</span> ${new Date(t.t).toLocaleTimeString('fr-FR')} ${t.txt}</div>`).join('');
+  drawCVD()}
+function drawCVD(){
+  const W=cc.width,H=cc.height;cx.fillStyle='#0b0e14';cx.fillRect(0,0,W,H);if(hist.length<2)return;
+  const base=hist[0],ser=[['Total',e=>tot(e)-tot(base),'#fff',2],...EX.map(x=>[x,e=>e.c[x]-base.c[x],XC[x],1])];
+  let lo=0,hi=0;for(const e of hist)for(const s of ser){const v=s[1](e);if(v<lo)lo=v;if(v>hi)hi=v}
+  const rg=(hi-lo)||1,Y=v=>H-14-(v-lo)/rg*(H-28),X=i=>i/(hist.length-1)*(W-60);
+  cx.fillStyle='rgba(255,255,255,.08)';cx.fillRect(0,Y(0),W-60,1);
+  for(const[n,f,c,w]of ser){if(n!=='Total'&&!S.on[n])continue;cx.strokeStyle=c;cx.lineWidth=w;cx.beginPath();
+    hist.forEach((e,i)=>i?cx.lineTo(X(i),Y(f(e))):cx.moveTo(0,Y(f(e))));cx.stroke()}
+  cx.font='11px ui-monospace,monospace';cx.fillStyle='#8a95aa';cx.textAlign='left';
+  cx.fillText('CVD (BTC, 15 min)',6,12);cx.textAlign='right';cx.fillText(hi.toFixed(0),W-6,12);cx.fillText(lo.toFixed(0),W-6,H-4)}
+
+/* ---------- UI ---------- */
+$('exs').innerHTML=EX.map(e=>`<label><span class="dot" data-e="${e}"></span><input type="checkbox" checked data-x="${e}"><span style="color:${XC[e]}">${e}</span></label>`).join('');
+$('exs').onchange=e=>{S.on[e.target.dataset.x]=e.target.checked?1:0};
+$('bk').onchange=e=>{S.bucket=+e.target.value;S.center=S.mid||S.center;redraw()};
+$('mq').onchange=e=>S.minQ=+e.target.value;
+$('gn').oninput=e=>{S.gain=+e.target.value;redraw()};
+hc.parentNode.addEventListener('wheel',e=>{e.preventDefault();
+  const i=BUCKETS.indexOf(S.bucket)+(e.deltaY>0?1:-1);if(i<0||i>=BUCKETS.length)return;
+  S.bucket=BUCKETS[i];$('bk').value=S.bucket;redraw()},{passive:false});
+function fit(){
+  for(const[c,b]of[[hc,hc.parentNode],[pc,pc.parentNode],[cc,cc.parentNode]]){c.width=b.clientWidth;c.height=b.clientHeight}
+  hm.width=hc.width;hm.height=hc.height;redraw()}
+new ResizeObserver(fit).observe(document.body);fit();
+setInterval(snap,S.colMs);setInterval(sample,1000);requestAnimationFrame(frame);
+</script></body></html>
